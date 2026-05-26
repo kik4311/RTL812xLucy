@@ -256,33 +256,46 @@ bool RTL8125::initEventSources(IOService *provider)
     int intrIndex = 0;
     int intrType = 0;
     bool result = false;
-    
+
     txQueue = reinterpret_cast<IOBasicOutputQueue *>(getOutputQueue());
-    
+
     if (txQueue == NULL) {
-        IOLog("Failed to get output queue.\n");
+        IOLog("[RTL8125] Failed to get output queue.\n");
         goto done;
     }
     txQueue->retain();
-    
+
+    /* Scan for an MSI interrupt vector. */
     while (pciDevice->getInterruptType(intrIndex, &intrType) == kIOReturnSuccess) {
-        if (intrType & kIOInterruptTypePCIMessaged){
+        IOLog("[RTL8125] interrupt index %d type 0x%x\n", intrIndex, intrType);
+        if (intrType & kIOInterruptTypePCIMessaged) {
             msiIndex = intrIndex;
             break;
         }
         intrIndex++;
     }
+
     if (msiIndex != -1) {
-        DebugLog("MSI interrupt index: %d\n", msiIndex);
-        
+        IOLog("[RTL8125] Using MSI interrupt at index %d.\n", msiIndex);
+
         if (useAppleVTD) {
             interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &RTL8125::interruptOccurredVTD), provider, msiIndex);
         } else {
             interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &RTL8125::interruptOccurred), provider, msiIndex);
         }
+        if (!interruptSource)
+            IOLog("[RTL8125] IOInterruptEventSource creation failed for MSI index %d.\n", msiIndex);
     }
+
+    /* Fall back to legacy INTx (index 0) if MSI was not found or failed.
+     * On some AMD hackintosh setups OpenCore doesn't expose MSI to IOPCIFamily. */
     if (!interruptSource) {
-        IOLog("Error: MSI index was not found or MSI interrupt could not be enabled.\n");
+        IOLog("[RTL8125] MSI not available, falling back to INTx interrupt.\n");
+        interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &RTL8125::interruptOccurred), provider, 0);
+    }
+
+    if (!interruptSource) {
+        IOLog("[RTL8125] Failed to create any interrupt source.\n");
         goto error1;
     }
     workLoop->addEventSource(interruptSource);
@@ -326,38 +339,41 @@ bool RTL8125::setupRxResources()
     rxBufArrayMem = IOMallocZero(kRxBufArraySize);
     
     if (!rxBufArrayMem) {
-        IOLog("Couldn't alloc receive buffer array.\n");
+        IOLog("[RTL8125] Couldn't alloc receive buffer array.\n");
         goto done;
     }
     rxBufArray = (rtlRxBufferInfo *)rxBufArrayMem;
 
     /* Create receiver descriptor array. */
     rxBufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryHostPhysicallyContiguous | kIOMapInhibitCache), kRxDescSize, 0xFFFFFFFFFFFFFF00ULL);
-    
+
     if (!rxBufDesc) {
-        IOLog("Couldn't alloc rxBufDesc.\n");
+        IOLog("[RTL8125] Couldn't alloc rxBufDesc.\n");
         goto error_buff;
     }
     if (rxBufDesc->prepare() != kIOReturnSuccess) {
-        IOLog("rxBufDesc->prepare() failed.\n");
+        IOLog("[RTL8125] rxBufDesc->prepare() failed.\n");
         goto error_prep;
     }
     rxDescArray = (RtlRxDesc *)rxBufDesc->getBytesNoCopy();
 
-    rxDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, mapper, NULL);
-    
+    /* Same rationale as in setupTxResources — avoid AMD IOMMU mapper
+     * on non-VTD systems so that gen64IOVMSegments returns a real
+     * physical address the hardware can use directly. */
+    rxDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, useAppleVTD ? mapper : nullptr, NULL);
+
     if (!rxDescDmaCmd) {
-        IOLog("Couldn't alloc rxDescDmaCmd.\n");
+        IOLog("[RTL8125] Couldn't alloc rxDescDmaCmd.\n");
         goto error_dma;
     }
-    
+
     if (rxDescDmaCmd->setMemoryDescriptor(rxBufDesc) != kIOReturnSuccess) {
-        IOLog("setMemoryDescriptor() failed.\n");
+        IOLog("[RTL8125] rxDescDmaCmd->setMemoryDescriptor() failed.\n");
         goto error_set_desc;
     }
-    
+
     if (rxDescDmaCmd->gen64IOVMSegments(&offset, &seg, &numSegs) != kIOReturnSuccess) {
-        IOLog("gen64IOVMSegments() failed.\n");
+        IOLog("[RTL8125] rxDescDmaCmd->gen64IOVMSegments() failed.\n");
         goto error_segm;
     }
     /* And the rx ring's physical address too. */
@@ -373,7 +389,7 @@ bool RTL8125::setupRxResources()
     rxPool = RTL8125LucyRxPool::withCapacity(kRxPoolMbufCap, kRxPoolClstCap);
 
     if (!rxPool) {
-        IOLog("Couldn't alloc receive buffer pool.\n");
+        IOLog("[RTL8125] Couldn't alloc receive buffer pool.\n");
         goto error_segm;
     }
 
@@ -382,7 +398,7 @@ bool RTL8125::setupRxResources()
         m = rxPool->getPacket(kRxBufferSize, MBUF_WAITOK);
 
         if (!m) {
-            IOLog("Couldn't get receive buffer from pool.\n");
+            IOLog("[RTL8125] Couldn't get receive buffer from pool.\n");
             goto error_buf;
         }
         rxBufArray[i].mbuf = m;
@@ -449,38 +465,43 @@ bool RTL8125::setupTxResources()
     txBufArrayMem = IOMallocZero(kTxBufArraySize);
     
     if (!txBufArrayMem) {
-        IOLog("Couldn't alloc transmit buffer array.\n");
+        IOLog("[RTL8125] Couldn't alloc transmit buffer array.\n");
         goto done;
     }
     txMbufArray = (mbuf_t *)txBufArrayMem;
-    
+
     /* Create transmitter descriptor array. */
     txBufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryHostPhysicallyContiguous | kIOMapInhibitCache), kTxDescSize, 0xFFFFFFFFFFFFFF00ULL);
-            
+
     if (!txBufDesc) {
-        IOLog("Couldn't alloc txBufDesc.\n");
+        IOLog("[RTL8125] Couldn't alloc txBufDesc.\n");
         goto error_buff;
     }
     if (txBufDesc->prepare() != kIOReturnSuccess) {
-        IOLog("txBufDesc->prepare() failed.\n");
+        IOLog("[RTL8125] txBufDesc->prepare() failed.\n");
         goto error_prep;
     }
     txDescArray = (RtlTxDesc *)txBufDesc->getBytesNoCopy();
     
-    txDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, mapper, NULL);
-    
+    /* Only pass the IOMMU mapper when using the AppleVTD path.
+     * On AMD hackintosh, IOMapper::copyMapperForDevice may return an
+     * AMD-Vi mapper that macOS cannot properly use, causing
+     * gen64IOVMSegments() to fail. Without VTD we want direct physical
+     * addresses, so use a NULL mapper for the descriptor ring command. */
+    txDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, useAppleVTD ? mapper : nullptr, NULL);
+
     if (!txDescDmaCmd) {
-        IOLog("Couldn't alloc txDescDmaCmd.\n");
+        IOLog("[RTL8125] Couldn't alloc txDescDmaCmd.\n");
         goto error_dma;
     }
-    
+
     if (txDescDmaCmd->setMemoryDescriptor(txBufDesc) != kIOReturnSuccess) {
-        IOLog("setMemoryDescriptor() failed.\n");
+        IOLog("[RTL8125] txDescDmaCmd->setMemoryDescriptor() failed.\n");
         goto error_set_desc;
     }
-    
+
     if (txDescDmaCmd->gen64IOVMSegments(&offset, &seg, &numSegs) != kIOReturnSuccess) {
-        IOLog("gen64IOVMSegments() failed.\n");
+        IOLog("[RTL8125] txDescDmaCmd->gen64IOVMSegments() failed.\n");
         goto error_segm;
     }
     /* Now get tx ring's physical address. */
@@ -503,7 +524,7 @@ bool RTL8125::setupTxResources()
         txMbufCursor = IOMbufNaturalMemoryCursor::withSpecification(PAGE_SIZE, kMaxSegs);
         
         if (!txMbufCursor) {
-            IOLog("Couldn't create txMbufCursor.\n");
+            IOLog("[RTL8125] Couldn't create txMbufCursor.\n");
             goto error_segm;
         }
         result = true;
@@ -542,20 +563,20 @@ bool RTL8125::setupStatResources()
     statCall = thread_call_allocate_with_options((thread_call_func_t) &runStatUpdateThread, (void *) this, THREAD_CALL_PRIORITY_KERNEL, 0);
     
     if (!statCall) {
-        IOLog("Couldn't alloc thread_call.\n");
+        IOLog("[RTL8125] Couldn't alloc thread_call.\n");
         goto done;
     }
 
     /* Create statistics dump buffer. */
     statBufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, (kIODirectionIn | kIOMemoryPhysicallyContiguous | kIOMemoryHostPhysicallyContiguous | kIOMapInhibitCache), sizeof(RtlStatData), 0xFFFFFFFFFFFFFF00ULL);
-    
+
     if (!statBufDesc) {
-        IOLog("Couldn't alloc statBufDesc.\n");
+        IOLog("[RTL8125] Couldn't alloc statBufDesc.\n");
         goto error_mem;
     }
-    
+
     if (statBufDesc->prepare() != kIOReturnSuccess) {
-        IOLog("statBufDesc->prepare() failed.\n");
+        IOLog("[RTL8125] statBufDesc->prepare() failed.\n");
         goto error_prep;
     }
     statData = (RtlStatData *)statBufDesc->getBytesNoCopy();
@@ -563,17 +584,17 @@ bool RTL8125::setupStatResources()
     statDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1);
     
     if (!statDescDmaCmd) {
-        IOLog("Couldn't alloc statDescDmaCmd.\n");
+        IOLog("[RTL8125] Couldn't alloc statDescDmaCmd.\n");
         goto error_dma;
     }
-    
+
     if (statDescDmaCmd->setMemoryDescriptor(statBufDesc) != kIOReturnSuccess) {
-        IOLog("setMemoryDescriptor() failed.\n");
+        IOLog("[RTL8125] statDescDmaCmd->setMemoryDescriptor() failed.\n");
         goto error_set_desc;
     }
-    
+
     if (statDescDmaCmd->gen64IOVMSegments(&offset, &seg, &numSegs) != kIOReturnSuccess) {
-        IOLog("gen64IOVMSegments() failed.\n");
+        IOLog("[RTL8125] statDescDmaCmd->gen64IOVMSegments() failed.\n");
         goto error_segm;
     }
     /* And the rx ring's physical address too. */

@@ -831,7 +831,8 @@ enum rtl8125_fc_mode {
 };
 
 struct rtl8125_private {
-    void __iomem *mmio_addr;    /* memory map physical address */
+    void __iomem *mmio_addr;    /* BAR2 MMIO virtual address (used for offsets >= 0x100) */
+    UInt16 io_addr;             /* BAR0 I/O port base (used for offsets < 0x100) */
     struct pci_dev *pci_dev;    /* Index of PCI device */
     
     //unsigned long state;
@@ -1029,12 +1030,42 @@ static const u16 other_q_intr_mask = (RxOK1 | RxDU1);
 #define HW_PHY_STATUS_EXT_INI   2
 #define HW_PHY_STATUS_LAN_ON    3
 
-#define RTL_W8(tp, reg, val8)   _OSWriteInt8((tp)->mmio_addr, (reg), (val8))
-#define RTL_W16(tp, reg, val16) OSWriteLittleInt16((tp)->mmio_addr, (reg), (val16))
-#define RTL_W32(tp, reg, val32) OSWriteLittleInt32((tp)->mmio_addr, (reg), (val32))
-#define RTL_R8(tp, reg)         _OSReadInt8((tp)->mmio_addr, (reg))
-#define RTL_R16(tp, reg)        OSReadLittleInt16((tp)->mmio_addr, (reg))
-#define RTL_R32(tp, reg)        OSReadLittleInt32((tp)->mmio_addr, (reg))
+/* I/O port primitives — x86 kernel is Ring 0, IN/OUT are legal. */
+static inline UInt8  rtl_inb (UInt16 p)           { UInt8  v; __asm__ volatile("inb  %w1,%b0":"=a"(v):"Nd"(p)); return v; }
+static inline UInt16 rtl_inw (UInt16 p)           { UInt16 v; __asm__ volatile("inw  %w1,%w0":"=a"(v):"Nd"(p)); return v; }
+static inline UInt32 rtl_inl (UInt16 p)           { UInt32 v; __asm__ volatile("inl  %w1,%0" :"=a"(v):"Nd"(p)); return v; }
+static inline void   rtl_outb(UInt16 p, UInt8  v) { __asm__ volatile("outb  %b0,%w1"::"a"(v),"Nd"(p)); }
+static inline void   rtl_outw(UInt16 p, UInt16 v) { __asm__ volatile("outw  %w0,%w1"::"a"(v),"Nd"(p)); }
+static inline void   rtl_outl(UInt16 p, UInt32 v) { __asm__ volatile("outl  %0,%w1" ::"a"(v),"Nd"(p)); }
+
+/* Hybrid register access: BAR0 I/O ports for offsets < 0x100 (always work),
+ * BAR2 MMIO for offsets >= 0x100 (silently fails on this AMD system but those
+ * are optional multi-queue registers — single-queue operation is unaffected). */
+static inline UInt8  rtl_r8 (struct rtl8125_private *tp, int reg) {
+    return ((unsigned)reg < 0x100) ? rtl_inb(tp->io_addr + (UInt8)reg) : _OSReadInt8(tp->mmio_addr, reg);
+}
+static inline UInt16 rtl_r16(struct rtl8125_private *tp, int reg) {
+    return ((unsigned)reg < 0x100) ? rtl_inw(tp->io_addr + (UInt8)reg) : OSReadLittleInt16(tp->mmio_addr, reg);
+}
+static inline UInt32 rtl_r32(struct rtl8125_private *tp, int reg) {
+    return ((unsigned)reg < 0x100) ? rtl_inl(tp->io_addr + (UInt8)reg) : OSReadLittleInt32(tp->mmio_addr, reg);
+}
+static inline void rtl_w8 (struct rtl8125_private *tp, int reg, UInt8  v) {
+    if ((unsigned)reg < 0x100) rtl_outb(tp->io_addr + (UInt8)reg, v); else _OSWriteInt8(tp->mmio_addr, reg, v);
+}
+static inline void rtl_w16(struct rtl8125_private *tp, int reg, UInt16 v) {
+    if ((unsigned)reg < 0x100) rtl_outw(tp->io_addr + (UInt8)reg, v); else OSWriteLittleInt16(tp->mmio_addr, reg, v);
+}
+static inline void rtl_w32(struct rtl8125_private *tp, int reg, UInt32 v) {
+    if ((unsigned)reg < 0x100) rtl_outl(tp->io_addr + (UInt8)reg, v); else OSWriteLittleInt32(tp->mmio_addr, reg, v);
+}
+
+#define RTL_W8(tp, reg, val8)   rtl_w8 ((tp), (reg), (UInt8) (val8))
+#define RTL_W16(tp, reg, val16) rtl_w16((tp), (reg), (UInt16)(val16))
+#define RTL_W32(tp, reg, val32) rtl_w32((tp), (reg), (UInt32)(val32))
+#define RTL_R8(tp, reg)         rtl_r8 ((tp), (reg))
+#define RTL_R16(tp, reg)        rtl_r16((tp), (reg))
+#define RTL_R32(tp, reg)        rtl_r32((tp), (reg))
 
 #define RTK_ADVERTISED_5000baseX_Full  BIT_ULL(48)
 #define RTK_SUPPORTED_5000baseX_Full BIT_ULL(48)

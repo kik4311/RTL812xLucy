@@ -51,27 +51,47 @@ bool RTL8125::initPCIConfigSpace(IOPCIDevice *provider)
     } else {
         IOLog("PCI power management unsupported.\n");
     }
+    /* Read PM state BEFORE requesting D0 so we know whether a delay is needed.
+     * Bits [1:0]: 0=D0, 1=D1, 2=D2, 3=D3hot. */
+    UInt16 pmCtrlBefore = pciPMCtrlOffset
+        ? provider->extendedConfigRead16(pciPMCtrlOffset) : 0;
+
     provider->enablePCIPowerManagement(kPCIPMCSPowerStateD0);
+
+    if ((pmCtrlBefore & 0x3) == 3) {
+        /* PCI spec requires 200 ms recovery time from D3hot before any
+         * register access. */
+        IOSleep(200);
+    }
     
     /* Get PCIe link information. */
     if (provider->extendedFindPCICapability(kIOPCIPCIExpressCapability, &pcieCapOffset)) {
         pcieLinkCap = provider->extendedConfigRead32(pcieCapOffset + kIOPCIELinkCapability);
         DebugLog("PCIe link capability: 0x%08x.\n", pcieLinkCap);
     }
-    /* Enable the device. */
+    /* Enable the device — keep I/O space on; the RTL8125's BAR0 I/O window is
+     * the only register path that reliably works on AMD X670E (MMIO on BAR2
+     * is broken: writes are silently dropped by the PCIe bridge). */
     cmdReg = provider->configRead16(kIOPCIConfigCommand);
-    cmdReg &= ~kIOPCICommandIOSpace;
-    cmdReg |= (kIOPCICommandBusMaster | kIOPCICommandMemorySpace | kIOPCICommandMemWrInvalidate);
+    cmdReg |= (kIOPCICommandBusMaster | kIOPCICommandMemorySpace | kIOPCICommandIOSpace | kIOPCICommandMemWrInvalidate);
     provider->configWrite16(kIOPCIConfigCommand, cmdReg);
     
     baseMap = provider->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2, kIOMapInhibitCache);
-    
+
     if (!baseMap) {
         IOLog("region #2 not an MMIO resource, aborting.\n");
         goto done;
     }
     linuxData.mmio_addr = reinterpret_cast<volatile void *>(baseMap->getVirtualAddress());
-    
+
+    /* BAR0 bits[1:0] are always 01 (I/O space indicator); mask them off.
+     * On AMD X670E hackintosh, BAR2 MMIO writes are silently dropped by the
+     * PCIe bridge.  The RTL_R/W macros use I/O ports for all register offsets
+     * < 0x100, which covers all registers needed for normal single-queue
+     * operation.  MMIO is retained for registers >= 0x100 (optional multi-queue
+     * features) where it works on Intel/real Mac and fails silently on AMD. */
+    linuxData.io_addr = (UInt16)(provider->configRead32(kIOPCIConfigBaseAddress0) & 0xFFFC);
+
     linuxData.org_pci_offset_80 = provider->extendedConfigRead8(0x80);
     linuxData.org_pci_offset_81 = provider->extendedConfigRead8(0x81);
 
@@ -160,7 +180,17 @@ bool RTL8125::rtl812xIdentifyChip(struct rtl8125_private *tp)
 {
     UInt32 reg, val32;
     UInt32 ICVerID;
-    
+    int i;
+
+    /* Software reset to bring the chip to a known state before reading the
+     * chip ID from TxConfig.  Register access uses I/O ports (BAR0) for all
+     * offsets < 0x100, which is reliable across Intel and AMD platforms. */
+    RTL_W8(tp, ChipCmd, CmdReset);
+    for (i = 0; i < 1000; i++) {
+        if (!(RTL_R8(tp, ChipCmd) & CmdReset)) break;
+        IODelay(100);
+    }
+
     val32 = RTL_R32(tp, TxConfig);
     reg = val32 & 0x7c800000;
     ICVerID = val32 & 0x00700000;

@@ -283,77 +283,78 @@ void RTL8125::free()
 bool RTL8125::start(IOService *provider)
 {
     bool result;
-    
+
     result = super::start(provider);
-    
+
     if (!result) {
-        IOLog("IOEthernetController::start failed.\n");
+        IOLog("[RTL8125] IOEthernetController::start failed.\n");
         goto done;
     }
     clear_mask((__M_CAST_M | __PROMISC_M), &stateFlags);
     multicastFilter = 0;
 
     pciDevice = OSDynamicCast(IOPCIDevice, provider);
-    
+
     if (!pciDevice) {
-        IOLog("No provider.\n");
+        IOLog("[RTL8125] No provider.\n");
         goto done;
     }
     pciDevice->retain();
-    
+
     if (!pciDevice->open(this)) {
-        IOLog("Failed to open provider.\n");
+        IOLog("[RTL8125] Failed to open provider.\n");
         goto error_open;
     }
     mapper = IOMapper::copyMapperForDevice(pciDevice);
 
     getParams();
-    
+
     if (!initPCIConfigSpace(pciDevice)) {
+        IOLog("[RTL8125] initPCIConfigSpace() failed.\n");
         goto error_cfg;
     }
 
     if (!rtl812xInit()) {
-        IOLog("Failed to initialize chip.\n");
+        IOLog("[RTL8125] rtl812xInit() failed.\n");
         goto error_cfg;
     }
-    
+
     if (!setupMediumDict()) {
-        IOLog("Failed to setup medium dictionary.\n");
+        IOLog("[RTL8125] setupMediumDict() failed.\n");
         goto error_cfg;
     }
     commandGate = getCommandGate();
-    
+
     if (!commandGate) {
-        IOLog("getCommandGate() failed.\n");
+        IOLog("[RTL8125] getCommandGate() failed.\n");
         goto error_gate;
     }
     commandGate->retain();
-    
+
     if (!setupTxResources()) {
-        IOLog("Error allocating Tx resources.\n");
+        IOLog("[RTL8125] setupTxResources() failed.\n");
         goto error_dma1;
     }
 
     if (!setupRxResources()) {
-        IOLog("Error allocating Rx resources.\n");
+        IOLog("[RTL8125] setupRxResources() failed.\n");
         goto error_dma2;
     }
 
     if (!setupStatResources()) {
-        IOLog("Error allocating Stat resources.\n");
+        IOLog("[RTL8125] setupStatResources() failed.\n");
         goto error_dma3;
     }
 
     if (!initEventSources(provider)) {
-        IOLog("initEventSources() failed.\n");
+        IOLog("[RTL8125] initEventSources() failed.\n");
         goto error_src;
     }
-    
+
     result = attachInterface(reinterpret_cast<IONetworkInterface**>(&netif));
 
     if (!result) {
-        IOLog("attachInterface() failed.\n");
+        IOLog("[RTL8125] attachInterface() failed.\n");
         goto error_src;
     }
     pciDevice->close(this);

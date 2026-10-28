@@ -283,7 +283,8 @@ void RTL8125::free()
 
 UInt32 rtlStopStage = 0;
 static UInt32 rtlSlow = 0;
-static UInt32 rtlFix = 1;
+static UInt32 rtlFix = 0;
+static bool rtlNicCF8Alive = false;
 
 /* The early boot part of the kernel message buffer is gone by the time Recovery
  * gives us a shell, so keep our own copy and publish it as the RTLDiagLog property. */
@@ -523,6 +524,118 @@ static void rtlTryLinkRecovery(IOPCIDevice *nic, UInt32 level)
     }
 }
 
+/*
+ * Legacy CF8/CFC configuration access. It bypasses IOPCIFamily, which answers
+ * all ones for a device it has stopped trusting (e.g. after a surprise link down).
+ */
+static UInt32 rtlCF8Read32(IOPCIDevice *dev, UInt8 reg)
+{
+    UInt32 addr = 0x80000000U | ((UInt32)dev->getBusNumber() << 16) |
+                  ((UInt32)dev->getDeviceNumber() << 11) | ((UInt32)dev->getFunctionNumber() << 8) | (reg & 0xfc);
+
+    rtl_outl(0xcf8, addr);
+    return rtl_inl(0xcfc);
+}
+
+static void rtlCF8Write32(IOPCIDevice *dev, UInt8 reg, UInt32 val)
+{
+    UInt32 addr = 0x80000000U | ((UInt32)dev->getBusNumber() << 16) |
+                  ((UInt32)dev->getDeviceNumber() << 11) | ((UInt32)dev->getFunctionNumber() << 8) | (reg & 0xfc);
+
+    rtl_outl(0xcf8, addr);
+    rtl_outl(0xcfc, val);
+}
+
+static UInt8 rtlCF8FindCap(IOPCIDevice *dev, UInt8 id)
+{
+    UInt8 ptr = rtlCF8Read32(dev, 0x34) & 0xfc;
+
+    for (int i = 0; ptr && (i < 48); i++) {
+        UInt32 hdr = rtlCF8Read32(dev, ptr);
+
+        if ((hdr & 0xff) == id)
+            return ptr;
+
+        ptr = (hdr >> 8) & 0xfc;
+    }
+    return 0;
+}
+
+/* Returns true if the NIC answers config cycles when IOPCIFamily is bypassed. */
+static bool rtlCF8Dump(IOPCIDevice *nic)
+{
+    UInt32 id = rtlCF8Read32(nic, 0x00);
+    UInt8 pm, pcie;
+
+    rtlLog("[RTL8125] cf8 %02x:%02x.%x id=%08x cmd/sts=%08x class=%08x\n", nic->getBusNumber(),
+           nic->getDeviceNumber(), nic->getFunctionNumber(), id, rtlCF8Read32(nic, 0x04), rtlCF8Read32(nic, 0x08));
+
+    if ((id & 0xffff) == 0xffff)
+        return false;
+
+    rtlLog("[RTL8125] cf8 bar0=%08x bar1=%08x bar2=%08x bar3=%08x bar4=%08x bar5=%08x int=%08x\n",
+           rtlCF8Read32(nic, 0x10), rtlCF8Read32(nic, 0x14), rtlCF8Read32(nic, 0x18),
+           rtlCF8Read32(nic, 0x1c), rtlCF8Read32(nic, 0x20), rtlCF8Read32(nic, 0x24), rtlCF8Read32(nic, 0x3c));
+
+    if ((pm = rtlCF8FindCap(nic, 0x01)))
+        rtlLog("[RTL8125] cf8 pm@%x pmcsr=%08x\n", pm, rtlCF8Read32(nic, pm + 4));
+
+    if ((pcie = rtlCF8FindCap(nic, 0x10)))
+        rtlLog("[RTL8125] cf8 pcie@%x devctl/sta=%08x lnkcap=%08x lnkctl/sta=%08x\n", pcie,
+               rtlCF8Read32(nic, pcie + 0x08), rtlCF8Read32(nic, pcie + 0x0c), rtlCF8Read32(nic, pcie + 0x10));
+
+    return true;
+}
+
+/*
+ * rtlfix=3: the NIC is alive but was reset behind IOPCIFamily's back. Put it
+ * into D0, rewrite BARs and command register through CF8 and turn ASPM off on
+ * both ends of the link.
+ */
+static void rtlCF8Revive(IOPCIDevice *nic)
+{
+    IOPCIDevice *bridge = rtlParentBridge(nic);
+    OSData *data = OSDynamicCast(OSData, nic->getProperty("assigned-addresses"));
+    IOByteCount off = 0;
+    UInt8 pm, pcie;
+
+    if ((pm = rtlCF8FindCap(nic, 0x01))) {
+        UInt32 pmcsr = rtlCF8Read32(nic, pm + 4);
+
+        if (pmcsr & 3) {
+            rtlCF8Write32(nic, pm + 4, pmcsr & ~3U);
+            IOSleep(20);
+        }
+    }
+    if (data) {
+        const UInt32 *cell = (const UInt32 *)data->getBytesNoCopy();
+        unsigned int count = data->getLength() / (5 * sizeof(UInt32));
+
+        for (unsigned int i = 0; i < count; i++, cell += 5) {
+            UInt8 reg = cell[0] & 0xff;
+
+            if ((reg < kIOPCIConfigBaseAddress0) || (reg > kIOPCIConfigBaseAddress5))
+                continue;
+
+            rtlCF8Write32(nic, reg, cell[2]);
+
+            if (((cell[0] >> 24) & 3) == 3)
+                rtlCF8Write32(nic, reg + 4, cell[1]);
+        }
+    }
+    rtlCF8Write32(nic, 0x04, (rtlCF8Read32(nic, 0x04) & 0xffff0000U) |
+                  kIOPCICommandIOSpace | kIOPCICommandMemorySpace | kIOPCICommandBusMaster);
+
+    if ((pcie = rtlCF8FindCap(nic, 0x10)))
+        rtlCF8Write32(nic, pcie + 0x10, rtlCF8Read32(nic, pcie + 0x10) & ~3U);
+
+    if (bridge && bridge->extendedFindPCICapability(kIOPCIPCIExpressCapability, &off))
+        bridge->extendedConfigWrite16(off + 0x10, bridge->extendedConfigRead16(off + 0x10) & ~0x0003);
+
+    rtlLog("[RTL8125] cf8 revive done.\n");
+    rtlCF8Dump(nic);
+}
+
 /* Read identification registers through both paths, without writing anything. */
 static void rtlDumpRawRegs(struct rtl8125_private *tp)
 {
@@ -571,10 +684,15 @@ bool RTL8125::start(IOService *provider)
     PE_parse_boot_argn("rtlstop", &rtlStopStage, sizeof(rtlStopStage));
     PE_parse_boot_argn("rtlslow", &rtlSlow, sizeof(rtlSlow));
     PE_parse_boot_argn("rtlfix", &rtlFix, sizeof(rtlFix));
-    rtlLog("[RTL8125] diag build v3, rtlstop=%u rtlslow=%u rtlfix=%u\n", rtlStopStage, rtlSlow, rtlFix);
+    rtlLog("[RTL8125] diag build v4, rtlstop=%u rtlslow=%u rtlfix=%u\n", rtlStopStage, rtlSlow, rtlFix);
 
     rtlDiagStep("PCI path before init");
     rtlDumpPCIPath(pciDevice);
+    rtlDiagStep("config space via CF8");
+    rtlNicCF8Alive = rtlCF8Dump(pciDevice);
+
+    if (rtlNicCF8Alive && (rtlFix == 3))
+        rtlCF8Revive(pciDevice);
 
     if (pciDevice->configRead16(kIOPCIConfigVendorID) == 0xffff) {
         rtlDiagStep("link recovery");
@@ -591,6 +709,11 @@ bool RTL8125::start(IOService *provider)
     if (rtlStopStage == 1) {
         rtlLog("[RTL8125] rtlstop=1: stopping after PCI dump.\n");
         goto error_cfg;
+    }
+    /* IOPCIFamily hides the NIC: take the I/O base from CF8 instead. */
+    if (rtlNicCF8Alive && (pciDevice->configRead16(kIOPCIConfigVendorID) == 0xffff)) {
+        linuxData.io_addr = (UInt16)(rtlCF8Read32(pciDevice, kIOPCIConfigBaseAddress0) & 0xfffc);
+        rtlLog("[RTL8125] io_addr from CF8: %04x\n", linuxData.io_addr);
     }
     rtlDiagStep("raw register reads");
     rtlDumpRawRegs(&linuxData);

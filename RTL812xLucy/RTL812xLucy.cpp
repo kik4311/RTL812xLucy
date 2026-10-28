@@ -283,6 +283,7 @@ void RTL8125::free()
 
 UInt32 rtlStopStage = 0;
 static UInt32 rtlSlow = 0;
+static UInt32 rtlFix = 1;
 
 /* The early boot part of the kernel message buffer is gone by the time Recovery
  * gives us a shell, so keep our own copy and publish it as the RTLDiagLog property. */
@@ -325,11 +326,46 @@ void rtlDiagStep(const char *what)
         IOSleep(1500);
 }
 
+/* Dump PCIe capability, L1 substates and AER registers of one device. */
+static void rtlDumpPCIe(IOPCIDevice *dev)
+{
+    IOByteCount off = 0;
+
+    if (dev->extendedFindPCICapability(kIOPCIPowerManagementCapability, &off))
+        rtlLog("[RTL8125]   pmcsr=%04x\n", dev->extendedConfigRead16(off + kIOPCIPMControl));
+
+    off = 0;
+
+    if (dev->extendedFindPCICapability(kIOPCIPCIExpressCapability, &off)) {
+        rtlLog("[RTL8125]   pcie@%x cap=%04x devcap=%08x devctl=%04x devsta=%04x\n", (UInt32)off,
+               dev->extendedConfigRead16(off + 0x02), dev->extendedConfigRead32(off + 0x04),
+               dev->extendedConfigRead16(off + 0x08), dev->extendedConfigRead16(off + 0x0a));
+        rtlLog("[RTL8125]   lnkcap=%08x lnkctl=%04x lnksta=%04x lnkctl2=%04x lnksta2=%04x\n",
+               dev->extendedConfigRead32(off + 0x0c), dev->extendedConfigRead16(off + 0x10),
+               dev->extendedConfigRead16(off + 0x12), dev->extendedConfigRead16(off + 0x30),
+               dev->extendedConfigRead16(off + 0x32));
+        rtlLog("[RTL8125]   sltcap=%08x sltctl=%04x sltsta=%04x devctl2=%04x\n",
+               dev->extendedConfigRead32(off + 0x14), dev->extendedConfigRead16(off + 0x18),
+               dev->extendedConfigRead16(off + 0x1a), dev->extendedConfigRead16(off + 0x28));
+    }
+    off = 0;
+
+    if (dev->extendedFindPCICapability(kIOPCIExpressL1PMSubstatesCapability, &off))
+        rtlLog("[RTL8125]   l1ss@%x cap=%08x ctl1=%08x ctl2=%08x\n", (UInt32)off,
+               dev->extendedConfigRead32(off + 0x04), dev->extendedConfigRead32(off + 0x08),
+               dev->extendedConfigRead32(off + 0x0c));
+    off = 0;
+
+    if (dev->extendedFindPCICapability(kIOPCIExpressErrorReportingCapability, &off))
+        rtlLog("[RTL8125]   aer@%x uncor=%08x mask=%08x sev=%08x cor=%08x\n", (UInt32)off,
+               dev->extendedConfigRead32(off + 0x04), dev->extendedConfigRead32(off + 0x08),
+               dev->extendedConfigRead32(off + 0x0c), dev->extendedConfigRead32(off + 0x10));
+}
+
 /* Dump config space of the NIC and every PCI bridge above it. */
 static void rtlDumpPCIPath(IOPCIDevice *nic)
 {
     IORegistryEntry *entry = nic;
-    IOByteCount off;
     int n = 0;
 
     for (int i = 0; entry && (i < 24) && (n < 6); i++, entry = entry->getParentEntry(gIOServicePlane)) {
@@ -342,26 +378,148 @@ static void rtlDumpPCIPath(IOPCIDevice *nic)
         UInt8 hdr = dev->configRead8(kIOPCIConfigHeaderType) & 0x7f;
 
         rtlLog("[RTL8125] pci[%d] %s %s id=%08x cmd=%04x sts=%04x\n", n, dev->getName(),
-              dev->getLocation() ? dev->getLocation() : "?", dev->configRead32(kIOPCIConfigVendorID),
-              dev->configRead16(kIOPCIConfigCommand), dev->configRead16(kIOPCIConfigStatus));
+               dev->getLocation() ? dev->getLocation() : "?", dev->configRead32(kIOPCIConfigVendorID),
+               dev->configRead16(kIOPCIConfigCommand), dev->configRead16(kIOPCIConfigStatus));
 
         if (hdr == 1) {
             rtlLog("[RTL8125]   bridge bus=%06x io=%04x up=%08x mem=%08x pref=%08x/%08x/%08x brctl=%04x secsts=%04x\n",
-                  dev->configRead32(0x18) & 0xffffff, dev->configRead16(0x1c), dev->configRead32(0x30),
-                  dev->configRead32(0x20), dev->configRead32(0x24), dev->configRead32(0x28),
-                  dev->configRead32(0x2c), dev->configRead16(0x3e), dev->configRead16(0x1e));
+                   dev->configRead32(0x18) & 0xffffff, dev->configRead16(0x1c), dev->configRead32(0x30),
+                   dev->configRead32(0x20), dev->configRead32(0x24), dev->configRead32(0x28),
+                   dev->configRead32(0x2c), dev->configRead16(0x3e), dev->configRead16(0x1e));
         } else {
             rtlLog("[RTL8125]   bar0=%08x bar1=%08x bar2=%08x bar3=%08x bar4=%08x bar5=%08x\n",
-                  dev->configRead32(0x10), dev->configRead32(0x14), dev->configRead32(0x18),
-                  dev->configRead32(0x1c), dev->configRead32(0x20), dev->configRead32(0x24));
+                   dev->configRead32(0x10), dev->configRead32(0x14), dev->configRead32(0x18),
+                   dev->configRead32(0x1c), dev->configRead32(0x20), dev->configRead32(0x24));
         }
-        if (dev->extendedFindPCICapability(kIOPCIPowerManagementCapability, &off))
-            rtlLog("[RTL8125]   pmcsr=%04x\n", dev->extendedConfigRead16(off + kIOPCIPMControl));
+        rtlDumpPCIe(dev);
+    }
+}
 
-        if (dev->extendedFindPCICapability(kIOPCIPCIExpressCapability, &off))
-            rtlLog("[RTL8125]   devctl=%04x devsta=%04x lnkctl=%04x lnksta=%04x\n",
-                  dev->extendedConfigRead16(off + 0x08), dev->extendedConfigRead16(off + 0x0a),
-                  dev->extendedConfigRead16(off + 0x10), dev->extendedConfigRead16(off + 0x12));
+static IOPCIDevice *rtlParentBridge(IOPCIDevice *nic)
+{
+    IORegistryEntry *entry = nic->getParentEntry(gIOServicePlane);
+
+    for (int i = 0; entry && (i < 4); i++, entry = entry->getParentEntry(gIOServicePlane)) {
+        IOPCIDevice *dev = OSDynamicCast(IOPCIDevice, entry);
+
+        if (dev)
+            return dev;
+    }
+    return NULL;
+}
+
+static bool rtlNicAlive(IOPCIDevice *nic, UInt32 ms)
+{
+    for (UInt32 t = 0; ; t += 10) {
+        if (nic->configRead16(kIOPCIConfigVendorID) != 0xffff)
+            return true;
+
+        if (t >= ms)
+            return false;
+
+        IOSleep(10);
+    }
+}
+
+/* Rewrite the BARs from "assigned-addresses" after a secondary bus reset. */
+static void rtlRestoreBARs(IOPCIDevice *nic)
+{
+    OSData *data = OSDynamicCast(OSData, nic->getProperty("assigned-addresses"));
+
+    if (!data)
+        return;
+
+    const UInt32 *cell = (const UInt32 *)data->getBytesNoCopy();
+    unsigned int count = data->getLength() / (5 * sizeof(UInt32));
+
+    for (unsigned int i = 0; i < count; i++, cell += 5) {
+        UInt8 reg = cell[0] & 0xff;
+
+        if ((reg < kIOPCIConfigBaseAddress0) || (reg > kIOPCIConfigBaseAddress5))
+            continue;
+
+        nic->configWrite32(reg, cell[2]);
+
+        if (((cell[0] >> 24) & 3) == 3)
+            nic->configWrite32(reg + 4, cell[1]);
+
+        rtlLog("[RTL8125] restored BAR %02x = %08x:%08x\n", reg, cell[1], cell[2]);
+    }
+    nic->configWrite16(kIOPCIConfigCommand, kIOPCICommandIOSpace | kIOPCICommandMemorySpace | kIOPCICommandBusMaster);
+}
+
+/*
+ * The NIC answers config cycles with all ones: the link to it is down.
+ * rtlfix=1: disable ASPM/L1SS on the downstream port and retrain the link.
+ * rtlfix=2: additionally pulse a secondary bus reset and restore the BARs.
+ */
+static void rtlTryLinkRecovery(IOPCIDevice *nic, UInt32 level)
+{
+    IOPCIDevice *bridge;
+    IOByteCount off = 0;
+    UInt16 lnkctl;
+
+    if (!level || rtlNicAlive(nic, 0))
+        return;
+
+    rtlLog("[RTL8125] NIC config space reads all ones, trying link recovery (rtlfix=%u).\n", level);
+
+    if (rtlNicAlive(nic, 1000)) {
+        rtlLog("[RTL8125] NIC came back after waiting.\n");
+        return;
+    }
+    bridge = rtlParentBridge(nic);
+
+    if (!bridge) {
+        rtlLog("[RTL8125] no parent bridge found.\n");
+        return;
+    }
+    if (bridge->extendedFindPCICapability(kIOPCIExpressL1PMSubstatesCapability, &off)) {
+        bridge->extendedConfigWrite32(off + 0x08, bridge->extendedConfigRead32(off + 0x08) & ~0xfU);
+        rtlLog("[RTL8125] bridge L1SS disabled, ctl1=%08x\n", bridge->extendedConfigRead32(off + 0x08));
+    }
+    off = 0;
+
+    if (!bridge->extendedFindPCICapability(kIOPCIPCIExpressCapability, &off)) {
+        rtlLog("[RTL8125] bridge has no PCIe capability.\n");
+        return;
+    }
+    lnkctl = bridge->extendedConfigRead16(off + 0x10);
+    rtlLog("[RTL8125] bridge lnkctl=%04x lnksta=%04x before retrain\n", lnkctl, bridge->extendedConfigRead16(off + 0x12));
+
+    /* ASPM off, link enabled, then retrain. */
+    lnkctl &= ~(0x0003 | 0x0010);
+    bridge->extendedConfigWrite16(off + 0x10, lnkctl);
+    IOSleep(10);
+    bridge->extendedConfigWrite16(off + 0x10, lnkctl | 0x0020);
+    IOSleep(200);
+
+    rtlLog("[RTL8125] bridge lnkctl=%04x lnksta=%04x after retrain\n",
+           bridge->extendedConfigRead16(off + 0x10), bridge->extendedConfigRead16(off + 0x12));
+
+    if (rtlNicAlive(nic, 1000)) {
+        rtlLog("[RTL8125] NIC is back after link retrain, id=%08x\n", nic->configRead32(kIOPCIConfigVendorID));
+        return;
+    }
+    if (level < 2)
+        return;
+
+    UInt16 brctl = bridge->configRead16(0x3e);
+
+    rtlLog("[RTL8125] secondary bus reset on %s\n", bridge->getName());
+    bridge->configWrite16(0x3e, brctl | 0x0040);
+    IOSleep(5);
+    bridge->configWrite16(0x3e, brctl & ~0x0040);
+    IOSleep(1000);
+
+    rtlLog("[RTL8125] bridge lnkctl=%04x lnksta=%04x after SBR\n",
+           bridge->extendedConfigRead16(off + 0x10), bridge->extendedConfigRead16(off + 0x12));
+
+    if (rtlNicAlive(nic, 1000)) {
+        rtlLog("[RTL8125] NIC is back after SBR, id=%08x\n", nic->configRead32(kIOPCIConfigVendorID));
+        rtlRestoreBARs(nic);
+    } else {
+        rtlLog("[RTL8125] NIC still not responding.\n");
     }
 }
 
@@ -412,8 +570,16 @@ bool RTL8125::start(IOService *provider)
 
     PE_parse_boot_argn("rtlstop", &rtlStopStage, sizeof(rtlStopStage));
     PE_parse_boot_argn("rtlslow", &rtlSlow, sizeof(rtlSlow));
-    rtlLog("[RTL8125] diag build, rtlstop=%u rtlslow=%u\n", rtlStopStage, rtlSlow);
+    PE_parse_boot_argn("rtlfix", &rtlFix, sizeof(rtlFix));
+    rtlLog("[RTL8125] diag build v3, rtlstop=%u rtlslow=%u rtlfix=%u\n", rtlStopStage, rtlSlow, rtlFix);
 
+    rtlDiagStep("PCI path before init");
+    rtlDumpPCIPath(pciDevice);
+
+    if (pciDevice->configRead16(kIOPCIConfigVendorID) == 0xffff) {
+        rtlDiagStep("link recovery");
+        rtlTryLinkRecovery(pciDevice, rtlFix);
+    }
     rtlDiagStep("initPCIConfigSpace");
 
     if (!initPCIConfigSpace(pciDevice)) {

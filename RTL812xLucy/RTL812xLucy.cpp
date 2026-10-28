@@ -19,6 +19,7 @@
 */
 
 #include "RTL812xLucy.hpp"
+#include <pexpert/pexpert.h>
 
 #pragma mark --- function prototypes ---
 
@@ -280,6 +281,73 @@ void RTL8125::free()
     super::free();
 }
 
+UInt32 rtlStopStage = 0;
+static UInt32 rtlSlow = 0;
+
+void rtlDiagStep(const char *what)
+{
+    IOLog("[RTL8125] step: %s\n", what);
+
+    if (rtlSlow)
+        IOSleep(1500);
+}
+
+/* Dump config space of the NIC and every PCI bridge above it. */
+static void rtlDumpPCIPath(IOPCIDevice *nic)
+{
+    IORegistryEntry *entry = nic;
+    IOByteCount off;
+    int n = 0;
+
+    for (int i = 0; entry && (i < 24) && (n < 6); i++, entry = entry->getParentEntry(gIOServicePlane)) {
+        IOPCIDevice *dev = OSDynamicCast(IOPCIDevice, entry);
+
+        if (!dev)
+            continue;
+
+        n++;
+        UInt8 hdr = dev->configRead8(kIOPCIConfigHeaderType) & 0x7f;
+
+        IOLog("[RTL8125] pci[%d] %s %s id=%08x cmd=%04x sts=%04x\n", n, dev->getName(),
+              dev->getLocation() ? dev->getLocation() : "?", dev->configRead32(kIOPCIConfigVendorID),
+              dev->configRead16(kIOPCIConfigCommand), dev->configRead16(kIOPCIConfigStatus));
+
+        if (hdr == 1) {
+            IOLog("[RTL8125]   bridge bus=%06x io=%04x up=%08x mem=%08x pref=%08x/%08x/%08x brctl=%04x secsts=%04x\n",
+                  dev->configRead32(0x18) & 0xffffff, dev->configRead16(0x1c), dev->configRead32(0x30),
+                  dev->configRead32(0x20), dev->configRead32(0x24), dev->configRead32(0x28),
+                  dev->configRead32(0x2c), dev->configRead16(0x3e), dev->configRead16(0x1e));
+        } else {
+            IOLog("[RTL8125]   bar0=%08x bar1=%08x bar2=%08x bar3=%08x bar4=%08x bar5=%08x\n",
+                  dev->configRead32(0x10), dev->configRead32(0x14), dev->configRead32(0x18),
+                  dev->configRead32(0x1c), dev->configRead32(0x20), dev->configRead32(0x24));
+        }
+        if (dev->extendedFindPCICapability(kIOPCIPowerManagementCapability, &off))
+            IOLog("[RTL8125]   pmcsr=%04x\n", dev->extendedConfigRead16(off + kIOPCIPMControl));
+
+        if (dev->extendedFindPCICapability(kIOPCIPCIExpressCapability, &off))
+            IOLog("[RTL8125]   devctl=%04x devsta=%04x lnkctl=%04x lnksta=%04x\n",
+                  dev->extendedConfigRead16(off + 0x08), dev->extendedConfigRead16(off + 0x0a),
+                  dev->extendedConfigRead16(off + 0x10), dev->extendedConfigRead16(off + 0x12));
+    }
+}
+
+/* Read identification registers through both paths, without writing anything. */
+static void rtlDumpRawRegs(struct rtl8125_private *tp)
+{
+    IOLog("[RTL8125] io_addr=%04x mmio=%p\n", tp->io_addr, tp->mmio_addr);
+
+    if (tp->io_addr)
+        IOLog("[RTL8125] IO:   TxConfig=%08x ChipCmd=%02x MAC0=%08x %04x\n",
+              rtl_inl(tp->io_addr + TxConfig), rtl_inb(tp->io_addr + ChipCmd),
+              rtl_inl(tp->io_addr + MAC0), rtl_inw(tp->io_addr + MAC0 + 4));
+
+    if (tp->mmio_addr)
+        IOLog("[RTL8125] MMIO: TxConfig=%08x ChipCmd=%02x MAC0=%08x %04x\n",
+              OSReadLittleInt32(tp->mmio_addr, TxConfig), _OSReadInt8(tp->mmio_addr, ChipCmd),
+              OSReadLittleInt32(tp->mmio_addr, MAC0), OSReadLittleInt16(tp->mmio_addr, MAC0 + 4));
+}
+
 bool RTL8125::start(IOService *provider)
 {
     bool result;
@@ -309,13 +377,37 @@ bool RTL8125::start(IOService *provider)
 
     getParams();
 
+    PE_parse_boot_argn("rtlstop", &rtlStopStage, sizeof(rtlStopStage));
+    PE_parse_boot_argn("rtlslow", &rtlSlow, sizeof(rtlSlow));
+    IOLog("[RTL8125] diag build, rtlstop=%u rtlslow=%u\n", rtlStopStage, rtlSlow);
+
+    rtlDiagStep("initPCIConfigSpace");
+
     if (!initPCIConfigSpace(pciDevice)) {
         IOLog("[RTL8125] initPCIConfigSpace() failed.\n");
+        goto error_cfg;
+    }
+    rtlDumpPCIPath(pciDevice);
+
+    if (rtlStopStage == 1) {
+        IOLog("[RTL8125] rtlstop=1: stopping after PCI dump.\n");
+        goto error_cfg;
+    }
+    rtlDiagStep("raw register reads");
+    rtlDumpRawRegs(&linuxData);
+
+    if (rtlStopStage == 2) {
+        IOLog("[RTL8125] rtlstop=2: stopping after raw register reads.\n");
         goto error_cfg;
     }
 
     if (!rtl812xInit()) {
         IOLog("[RTL8125] rtl812xInit() failed.\n");
+        goto error_cfg;
+    }
+
+    if (rtlStopStage == 4) {
+        IOLog("[RTL8125] rtlstop=4: stopping after chip init.\n");
         goto error_cfg;
     }
 
@@ -330,6 +422,8 @@ bool RTL8125::start(IOService *provider)
         goto error_gate;
     }
     commandGate->retain();
+
+    rtlDiagStep("setupTxResources");
 
     if (!setupTxResources()) {
         IOLog("[RTL8125] setupTxResources() failed.\n");
@@ -346,10 +440,18 @@ bool RTL8125::start(IOService *provider)
         goto error_dma3;
     }
 
+    rtlDiagStep("initEventSources");
+
     if (!initEventSources(provider)) {
         IOLog("[RTL8125] initEventSources() failed.\n");
         goto error_src;
     }
+
+    if (rtlStopStage == 5) {
+        IOLog("[RTL8125] rtlstop=5: stopping before attachInterface.\n");
+        goto error_src;
+    }
+    rtlDiagStep("attachInterface");
 
     result = attachInterface(reinterpret_cast<IONetworkInterface**>(&netif));
 

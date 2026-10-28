@@ -375,10 +375,19 @@ bool RTL8125::rtl812xInit()
     bool result = false;
     
     /* Identify chip attached to board. */
+    rtlDiagStep("identify chip (soft reset + TxConfig)");
+
     if (!rtl812xIdentifyChip(tp)) {
         IOLog("Unknown chipset. Aborting...\n");
         goto done;
     }
+    IOLog("[RTL8125] chip identified: mcfg=%u TxConfig=%08x\n", tp->mcfg, RTL_R32(tp, TxConfig));
+
+    if (rtlStopStage == 3) {
+        IOLog("[RTL8125] rtlstop=3: stopping after chip identification.\n");
+        goto done;
+    }
+    rtlDiagStep("get_bios_setting + ASPM");
 
     tp->phy_reset_enable = rtl8125_xmii_reset_enable;
     tp->phy_reset_pending = rtl8125_xmii_reset_pending;
@@ -392,6 +401,7 @@ bool RTL8125::rtl812xInit()
     }
     setupASPM(pciDevice, true, tp->aspm);
 
+    rtlDiagStep("init_software_variable");
     rtl8125_init_software_variable(tp);
     
     switch (tp->mcfg) {
@@ -455,10 +465,14 @@ bool RTL8125::rtl812xInit()
         eee->tx_lpi_timer = ETH_DATA_LEN + ETH_HLEN + 0x20;
     }
 
+    rtlDiagStep("exit_oob");
     rtl8125_exit_oob(tp);
+    rtlDiagStep("rtl812xHwInit");
     rtl812xHwInit(tp);
 
+    rtlDiagStep("nic_reset");
     rtl8125_nic_reset(tp);
+    rtlDiagStep("eeprom + initMacAddr");
     
     /* Get production from EEPROM */
     rtl8125_eeprom_type(tp);

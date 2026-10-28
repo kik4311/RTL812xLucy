@@ -34,6 +34,14 @@
 
 #define    RELEASE(x)    if(x){(x)->release();(x)=NULL;}
 
+/* Bring-up diagnostics, controlled by boot-args:
+ *   rtlslow=1  log every init step and pause 1.5 s so it can be read on a -v screen
+ *   rtlstop=N  abort start() cleanly at stage N (1 = after PCI dump, 2 = after raw
+ *              register reads, 3 = after chip identification, 4 = after chip init,
+ *              5 = after DMA/interrupt setup, before attachInterface) */
+extern UInt32 rtlStopStage;
+void rtlDiagStep(const char *what);
+
 #define super IOEthernetController
 
 enum

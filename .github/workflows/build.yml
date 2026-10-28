@@ -6,7 +6,11 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, macos-15]
     steps:
       - uses: actions/checkout@v4
       - name: Build
@@ -19,5 +23,5 @@ jobs:
           zip -r "$GITHUB_WORKSPACE/RTL812xLucy-diag.kext.zip" RTL812xLucy.kext
       - uses: actions/upload-artifact@v4
         with:
-          name: RTL812xLucy-diag
+          name: RTL812xLucy-diag-${{ matrix.os }}
           path: RTL812xLucy-diag.kext.zip

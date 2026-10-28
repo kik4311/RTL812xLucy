@@ -378,13 +378,13 @@ bool RTL8125::rtl812xInit()
     rtlDiagStep("identify chip (soft reset + TxConfig)");
 
     if (!rtl812xIdentifyChip(tp)) {
-        IOLog("Unknown chipset. Aborting...\n");
+        rtlLog("[RTL8125] Unknown chipset. Aborting...\n");
         goto done;
     }
-    IOLog("[RTL8125] chip identified: mcfg=%u TxConfig=%08x\n", tp->mcfg, RTL_R32(tp, TxConfig));
+    rtlLog("[RTL8125] chip identified: mcfg=%u TxConfig=%08x\n", tp->mcfg, RTL_R32(tp, TxConfig));
 
     if (rtlStopStage == 3) {
-        IOLog("[RTL8125] rtlstop=3: stopping after chip identification.\n");
+        rtlLog("[RTL8125] rtlstop=3: stopping after chip identification.\n");
         goto done;
     }
     rtlDiagStep("get_bios_setting + ASPM");

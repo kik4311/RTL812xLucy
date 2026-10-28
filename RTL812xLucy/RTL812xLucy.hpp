@@ -40,7 +40,9 @@
  *              register reads, 3 = after chip identification, 4 = after chip init,
  *              5 = after DMA/interrupt setup, before attachInterface) */
 extern UInt32 rtlStopStage;
+extern OSArray *rtlDiagLog;
 void rtlDiagStep(const char *what);
+void rtlLog(const char *fmt, ...) __printflike(1, 2);
 
 #define super IOEthernetController
 
